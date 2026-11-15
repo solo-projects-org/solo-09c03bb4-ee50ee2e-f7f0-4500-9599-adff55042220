@@ -25,6 +25,22 @@ curl -sS "http://localhost:8000/api/v1/trips/T1/stops" | jq
 # 按版号查询（旧版）
 curl -sS "http://localhost:8000/api/v1/trips/T1/stops?version=1" | jq
 
+# 批量补传车载终端实际到站（version=current 时接收即固定为当前具体版号）
+curl -sS -X POST http://localhost:8000/api/v1/arrivals \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "current",
+    "trip_id": "T2",
+    "service_day": "2026-11-15T00:00:00+08:00",
+    "events": [
+      {"stop_sequence": 1, "actual_arrival": "2026-11-15T23:42:10+08:00", "revision": 1},
+      {"stop_sequence": 3, "actual_arrival": "2026-11-16T00:06:30+08:00", "revision": 1}
+    ]
+  }' | jq
+
+# 按具体版号、班次和服务日查询逐站早晚秒数
+curl -sS "http://localhost:8000/api/v1/versions/2/trips/T2/arrivals?service_day=2026-11-15T00:00:00%2B08:00" | jq
+
 # 下载原 ZIP
 curl -sS -OJ "http://localhost:8000/api/v1/versions/1/download"
 ```
@@ -38,10 +54,33 @@ curl -sS -OJ "http://localhost:8000/api/v1/versions/1/download"
 | `GET` | `/api/v1/versions/{version}` | 版本元信息（`version` 可为版号或 `current`） |
 | `GET` | `/api/v1/versions/{version}/trips/{trip_id}/stops` | 指定版本某班次的完整停站 |
 | `GET` | `/api/v1/trips/{trip_id}/stops?version=…` | 班次停站，`version` 省略时为当前版本 |
+| `POST` | `/api/v1/arrivals` | 批量补传实际到站事件，返回逐站偏差 |
+| `GET` | `/api/v1/versions/{version}/trips/{trip_id}/arrivals` | 按版本查询某班次某服务日的到站偏差 |
+| `GET` | `/api/v1/trips/{trip_id}/arrivals?service_day=…&version=…` | 到站偏差查询，`version` 省略时为当前版本 |
 | `GET` | `/api/v1/versions/{version}/download` | 下载该版本原始 ZIP |
 | `GET` | `/healthz` | 健康检查 |
 
-Swagger：`/docs`，OpenAPI：`/openapi.json`。
+Swagger：`/docs`，OpenAPI：`/openapi.json`。补传与偏差查询均可直接在 Swagger UI 中操作。
+
+## 到站事件补传
+
+提交体字段：
+
+- `version`：版号或 `current`；服务端在接收时把它固定解析为具体版号（响应中的 `version_id`），观测随后只属于该版本。
+- `trip_id`：班次 ID，必须存在于该版 `trips.txt`，否则整批 `404` 不入库。
+- `service_day`：服务日零点，ISO 8601 带时区偏移且本地时间为 `00:00:00`（如 `2026-11-15T00:00:00+08:00`）；存储时归一化为 UTC 瞬间作为服务日键，不同偏移表达的同一零点等价。
+- `events[]`：每项含 `stop_sequence`（该版停站表中的站序）、`actual_arrival`（**必须带时区偏移**的 ISO 8601 时刻，不接受无时区时间）和非负整数 `revision` 终端修订号。未知站序或无效时间使整批 `422` 不入库。
+
+偏差口径：实际时刻与计划时刻都按「服务日零点起算的挂钟秒数」比较，`deviation_seconds = 实际秒数 − 计划秒数`，正数晚点、负数早点、0 准点。超过 24 点的 GTFS 计划时刻（如 `24:05:00`）天然按同一服务日零点起算，无需特殊处理；跨午夜的实际到站（次日凌晨）同样正确。
+
+修订号与重复规则（同批内重复站序遵循相同规则）：
+
+- 高修订号覆盖旧观测；低修订号迟到只标记 `ignored`，不回退已有数据。
+- 同号同内容重送标记 `duplicate`，幂等且不重复计入、不更新写入时间。
+- 同号异内容（含同一批次内两条同号异内容）整批 `409` 拒收，无任何写入。
+- 每条事件在响应 `results[]` 中给出 `stored` / `duplicate` / `ignored` 状态及该事件的偏差；`stops[]` 返回该版完整停站表与本服务日最终已提交观测。
+
+一致性：每批补传在单个 `BEGIN IMMEDIATE` 写事务内完成「解析版号 → 校验班次/站序 → 折叠修订规则 → 写入 → 提交」，并发补传串行化；读者在单个读事务中只会看到某一已提交批次的完整结果。观测表以 `(version_id, trip_id, service_day, stop_sequence)` 为主键并外键绑定到具体版本的停站行，因此新版本发布后旧版观测不会串入新版，按具体版号查询只见该版已提交结果。
 
 ## 发布校验
 
@@ -81,6 +120,7 @@ Swagger：`/docs`，OpenAPI：`/openapi.json`。
 
 - 容器数据目录 `/data`（Docker volume `gtfs-data`）：`gtfs.db`、`artifacts/`、`staging/`。
 - 环境变量 `GTFS_DATA_DIR` 可改数据目录，`GTFS_MAX_UPLOAD_BYTES` 可改上传大小上限（默认 256 MiB）。
+- 到站观测保存在同一 SQLite 库的 `arrival_observations` 表中，随版本数据持久化，重启不丢失；删除版本时其观测随外键级联删除。
 
 ## 本地运行与测试
 

@@ -107,6 +107,41 @@ class ArtifactCorrupt(StorageError):
         )
 
 
+class UnknownStopSequence(StorageError):
+    def __init__(self, version_id: int, trip_id: str, stop_sequence: int):
+        super().__init__(
+            "unknown_stop_sequence",
+            f"stop_sequence {stop_sequence} does not exist for trip_id "
+            f"{trip_id!r} in version {version_id}; the whole batch was rejected",
+            422,
+        )
+        self.stop_sequence = stop_sequence
+
+
+class ArrivalConflict(StorageError):
+    """Same revision number carrying different content for one observation."""
+
+    def __init__(self, trip_id: str, stop_sequence: int, revision: int):
+        super().__init__(
+            "arrival_revision_conflict",
+            f"revision {revision} for trip_id {trip_id!r} stop_sequence "
+            f"{stop_sequence} already exists with different content; "
+            "the whole batch was rejected and nothing was stored",
+            409,
+        )
+        self.stop_sequence = stop_sequence
+        self.revision = revision
+
+
+class _PendingObservation(dict):
+    """A batch-local observation that may replace a committed row.
+
+    A plain ``dict`` subclass so fields can be read with the same
+    ``row["column"]`` syntax used for ``sqlite3.Row``; the type also lets the
+    persist step tell uncommitted batch winners apart from untouched rows.
+    """
+
+
 @dataclass(frozen=True)
 class VersionInfo:
     version_id: int
@@ -158,6 +193,27 @@ CREATE TABLE IF NOT EXISTS stop_times (
     FOREIGN KEY (version_id, stop_id) REFERENCES stops(version_id, stop_id),
     FOREIGN KEY (version_id, trip_id) REFERENCES trips(version_id, trip_id)
 );
+
+-- Actual arrivals back-filled by on-board terminals.  Every observation is
+-- bound to the exact published version (and therefore to that version's
+-- stop_times row), so observations made against an old version can never be
+-- read through a new version.  service_day is the service-day midnight
+-- normalised to a UTC instant, which makes the same service day identical
+-- regardless of the offset used when it was submitted.
+CREATE TABLE IF NOT EXISTS arrival_observations (
+    version_id         INTEGER NOT NULL REFERENCES versions(version_id) ON DELETE CASCADE,
+    trip_id            TEXT    NOT NULL,
+    service_day        TEXT    NOT NULL,
+    stop_sequence      INTEGER NOT NULL,
+    actual_arrival     TEXT    NOT NULL,
+    actual_arrival_utc TEXT    NOT NULL,
+    actual_seconds     INTEGER NOT NULL,
+    revision           INTEGER NOT NULL,
+    recorded_at        TEXT    NOT NULL,
+    PRIMARY KEY (version_id, trip_id, service_day, stop_sequence),
+    FOREIGN KEY (version_id, trip_id, stop_sequence)
+        REFERENCES stop_times (version_id, trip_id, stop_sequence) ON DELETE CASCADE
+);
 """
 
 
@@ -174,6 +230,8 @@ class Store:
         # Serialises publications inside this process; SQLite's own
         # BEGIN IMMEDIATE serialises them across processes as well.
         self._publish_lock = threading.Lock()
+        # Same role for arrival back-fill batches.
+        self._arrival_lock = threading.Lock()
 
     # ------------------------------------------------------------------ setup
     def init(self) -> None:
@@ -483,6 +541,262 @@ class Store:
             for row in rows
         ]
         return self._version_info(version_row), trip_row["route_id"], stops
+
+    # ------------------------------------------------------- arrival events
+    def submit_arrivals(
+        self,
+        version: str,
+        trip_id: str,
+        service_day_utc: str,
+        service_day_submitted: str,
+        events: List[dict],
+    ) -> dict:
+        """Atomically apply one back-fill batch.
+
+        ``events`` is an ordered list of dicts with keys ``stop_sequence``,
+        ``actual_arrival`` (submitted text), ``actual_arrival_utc``,
+        ``actual_seconds`` and ``revision``; the API layer has already parsed
+        and normalised them.  This method enforces the revision rules:
+
+        * higher revision overwrites the stored observation;
+        * a lower revision arriving late is ignored and never rolls data back;
+        * the same revision with identical content is an idempotent no-op;
+        * the same revision with different content rejects the whole batch
+          (also when the contradiction appears twice inside the batch);
+        * repeated stop_sequences inside the batch follow the same rules.
+
+        The whole check-and-write runs inside one ``BEGIN IMMEDIATE``
+        transaction, so concurrent batches are serialised and readers either
+        see the state before the batch or the fully applied state.
+        """
+        recorded_at = utc_now()
+        with self._arrival_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                version_id = self._resolve_version(conn, version)
+                trip_row = conn.execute(
+                    "SELECT 1 FROM trips WHERE version_id = ? AND trip_id = ?",
+                    (version_id, trip_id),
+                ).fetchone()
+                if trip_row is None:
+                    raise TripNotFound(version_id, trip_id)
+
+                planned_rows = conn.execute(
+                    "SELECT st.stop_sequence, st.stop_id, s.stop_name, "
+                    "       st.arrival_time, st.arrival_seconds "
+                    "FROM stop_times AS st "
+                    "JOIN stops AS s "
+                    "  ON s.version_id = st.version_id AND s.stop_id = st.stop_id "
+                    "WHERE st.version_id = ? AND st.trip_id = ? "
+                    "ORDER BY st.stop_sequence",
+                    (version_id, trip_id),
+                ).fetchall()
+                planned = {
+                    int(row["stop_sequence"]): int(row["arrival_seconds"])
+                    for row in planned_rows
+                }
+                planned_stops = [
+                    {
+                        "stop_sequence": row["stop_sequence"],
+                        "stop_id": row["stop_id"],
+                        "stop_name": row["stop_name"],
+                        "arrival_time": row["arrival_time"],
+                        "arrival_seconds": row["arrival_seconds"],
+                    }
+                    for row in planned_rows
+                ]
+
+                existing_rows = conn.execute(
+                    "SELECT stop_sequence, actual_arrival_utc, actual_seconds, "
+                    "       revision, actual_arrival, recorded_at "
+                    "FROM arrival_observations "
+                    "WHERE version_id = ? AND trip_id = ? AND service_day = ?",
+                    (version_id, trip_id, service_day_utc),
+                ).fetchall()
+                # Working copy of committed observations keyed by sequence.
+                current: Dict[int, sqlite3.Row] = {
+                    int(row["stop_sequence"]): row for row in existing_rows
+                }
+
+                results: List[dict] = []
+                # Effective (winning) state per sequence after this batch,
+                # built incrementally so later events in the same batch can
+                # override earlier ones.
+                for event in events:
+                    sequence = int(event["stop_sequence"])
+                    if sequence not in planned:
+                        raise UnknownStopSequence(version_id, trip_id, sequence)
+                    revision = int(event["revision"])
+                    holder = current.get(sequence)
+
+                    if holder is None:
+                        status = "stored"
+                        current[sequence] = _PendingObservation(
+                            stop_sequence=sequence,
+                            actual_arrival=event["actual_arrival"],
+                            actual_arrival_utc=event["actual_arrival_utc"],
+                            actual_seconds=event["actual_seconds"],
+                            revision=revision,
+                        )
+                    else:
+                        held_revision = int(holder["revision"])
+                        if revision < held_revision:
+                            status = "ignored"
+                        elif revision == held_revision:
+                            if holder["actual_arrival_utc"] == event["actual_arrival_utc"]:
+                                status = "duplicate"
+                            else:
+                                raise ArrivalConflict(trip_id, sequence, revision)
+                        else:
+                            status = "stored"
+                            current[sequence] = _PendingObservation(
+                                stop_sequence=sequence,
+                                actual_arrival=event["actual_arrival"],
+                                actual_arrival_utc=event["actual_arrival_utc"],
+                                actual_seconds=event["actual_seconds"],
+                                revision=revision,
+                            )
+                    results.append(
+                        {
+                            "stop_sequence": sequence,
+                            "revision": revision,
+                            "actual_arrival": event["actual_arrival"],
+                            "status": status,
+                        }
+                    )
+
+                # Persist every sequence whose winning state is new or changed
+                # relative to the committed row.  Same-revision duplicates and
+                # ignored (late, lower revision) events perform no write.
+                for sequence, holder in current.items():
+                    if not isinstance(holder, _PendingObservation):
+                        continue  # untouched committed row
+                    conn.execute(
+                        "INSERT INTO arrival_observations "
+                        "(version_id, trip_id, service_day, stop_sequence, "
+                        " actual_arrival, actual_arrival_utc, actual_seconds, "
+                        " revision, recorded_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT (version_id, trip_id, service_day, stop_sequence) "
+                        "DO UPDATE SET actual_arrival = excluded.actual_arrival, "
+                        "  actual_arrival_utc = excluded.actual_arrival_utc, "
+                        "  actual_seconds = excluded.actual_seconds, "
+                        "  revision = excluded.revision, "
+                        "  recorded_at = excluded.recorded_at",
+                        (
+                            version_id,
+                            trip_id,
+                            service_day_utc,
+                            sequence,
+                            holder["actual_arrival"],
+                            holder["actual_arrival_utc"],
+                            holder["actual_seconds"],
+                            holder["revision"],
+                            recorded_at,
+                        ),
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+            return {
+                "version_id": version_id,
+                "trip_id": trip_id,
+                "service_day": service_day_utc,
+                "service_day_submitted": service_day_submitted,
+                "recorded_at": recorded_at,
+                "results": results,
+                "planned_seconds": planned,
+                "planned_stops": planned_stops,
+                "observations": {
+                    seq: {
+                        "stop_sequence": seq,
+                        "actual_arrival": holder["actual_arrival"],
+                        "actual_arrival_utc": holder["actual_arrival_utc"],
+                        "actual_seconds": int(holder["actual_seconds"]),
+                        "revision": int(holder["revision"]),
+                        "recorded_at": (
+                            recorded_at
+                            if isinstance(holder, _PendingObservation)
+                            else holder["recorded_at"]
+                        ),
+                    }
+                    for seq, holder in sorted(current.items())
+                },
+            }
+
+    def get_arrivals(
+        self, version: str, trip_id: str, service_day_utc: str
+    ) -> dict:
+        """Read planned stops plus committed observations from one snapshot."""
+        with self.read_transaction() as conn:
+            version_id = self._resolve_version(conn, version)
+            version_row = conn.execute(
+                "SELECT * FROM versions WHERE version_id = ?", (version_id,)
+            ).fetchone()
+            if version_row is None:  # pragma: no cover - resolved above
+                raise VersionNotFound(version)
+            trip_row = conn.execute(
+                "SELECT trip_id, route_id FROM trips "
+                "WHERE version_id = ? AND trip_id = ?",
+                (version_id, trip_id),
+            ).fetchone()
+            if trip_row is None:
+                raise TripNotFound(version_id, trip_id)
+            stop_rows = conn.execute(
+                "SELECT st.stop_sequence, st.stop_id, s.stop_name, "
+                "       st.arrival_time, st.arrival_seconds "
+                "FROM stop_times AS st "
+                "JOIN stops AS s "
+                "  ON s.version_id = st.version_id AND s.stop_id = st.stop_id "
+                "WHERE st.version_id = ? AND st.trip_id = ? "
+                "ORDER BY st.stop_sequence",
+                (version_id, trip_id),
+            ).fetchall()
+            observation_rows = conn.execute(
+                "SELECT stop_sequence, actual_arrival, actual_arrival_utc, "
+                "       actual_seconds, revision, recorded_at "
+                "FROM arrival_observations "
+                "WHERE version_id = ? AND trip_id = ? AND service_day = ? "
+                "ORDER BY stop_sequence",
+                (version_id, trip_id, service_day_utc),
+            ).fetchall()
+
+        stops = [
+            {
+                "stop_sequence": row["stop_sequence"],
+                "stop_id": row["stop_id"],
+                "stop_name": row["stop_name"],
+                "arrival_time": row["arrival_time"],
+                "arrival_seconds": row["arrival_seconds"],
+            }
+            for row in stop_rows
+        ]
+        observations = {
+            int(row["stop_sequence"]): {
+                "stop_sequence": int(row["stop_sequence"]),
+                "actual_arrival": row["actual_arrival"],
+                "actual_arrival_utc": row["actual_arrival_utc"],
+                "actual_seconds": int(row["actual_seconds"]),
+                "revision": int(row["revision"]),
+                "recorded_at": row["recorded_at"],
+            }
+            for row in observation_rows
+        }
+        return {
+            "version": self._version_info(version_row),
+            "version_id": version_id,
+            "trip_id": trip_id,
+            "route_id": trip_row["route_id"],
+            "service_day": service_day_utc,
+            "stops": stops,
+            "observations": observations,
+        }
 
     # ------------------------------------------------------------- artifacts
     def artifact_path(self, info: VersionInfo) -> Path:
